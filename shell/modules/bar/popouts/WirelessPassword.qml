@@ -45,10 +45,10 @@ ColumnLayout {
                 connectButton.enabled = true;
                 connectButton.text = qsTr("Connect");
                 passwordContainer.passwordBuffer = "";
-                // Delete the failed connection
-                if (root.network && root.network.ssid) {
-                    Nmcli.forgetNetwork(root.network.ssid);
-                }
+                // Deliberately no forgetNetwork() here. Reaching this branch
+                // only means the poll timed out, not that the passphrase was
+                // wrong, so deleting the profile threw away working saved
+                // networks whenever a connection was merely slow to come up.
             }
         }
     }
@@ -108,6 +108,13 @@ ColumnLayout {
 
     Connections {
         function onCurrentNameChanged() {
+            // Drop the network the dialog was last opened for. The retry timer
+            // below only refills root.network while it is unset, so a stale
+            // value survived into the next attempt: the dialog kept showing the
+            // previous SSID and sent the typed password to that network instead
+            // of the one just clicked.
+            root.network = null;
+
             if (root.popouts.currentName === "wirelesspassword") {
                 // Update network when popout becomes active
                 Qt.callLater(() => {
@@ -545,10 +552,11 @@ ColumnLayout {
                                 enabled = true;
                                 text = qsTr("Connect");
                                 passwordContainer.passwordBuffer = "";
-                                // Delete the failed connection
-                                if (root.network && root.network.ssid) {
-                                    Nmcli.forgetNetwork(root.network.ssid);
-                                }
+                                // The profile is intentionally kept. A rejected
+                                // passphrase is now overwritten in place on the
+                                // next attempt, so there is nothing stale to
+                                // clean up, and deleting here also destroyed
+                                // profiles that were configured by hand.
                             } else {
                                 // Connection failed immediately - show error
                                 connectionMonitor.stop();
@@ -557,10 +565,11 @@ ColumnLayout {
                                 enabled = true;
                                 text = qsTr("Connect");
                                 passwordContainer.passwordBuffer = "";
-                                // Delete the failed connection
-                                if (root.network && root.network.ssid) {
-                                    Nmcli.forgetNetwork(root.network.ssid);
-                                }
+                                // The profile is intentionally kept. A rejected
+                                // passphrase is now overwritten in place on the
+                                // next attempt, so there is nothing stale to
+                                // clean up, and deleting here also destroyed
+                                // profiles that were configured by hand.
                             }
                         });
 
@@ -630,8 +639,9 @@ ColumnLayout {
                 connectButton.enabled = true;
                 connectButton.text = qsTr("Connect");
                 passwordContainer.passwordBuffer = "";
-                // Delete the failed connection
-                Nmcli.forgetNetwork(ssid);
+                // The profile is kept so the user can retry, and so that a
+                // network configured outside the shell survives a bad guess at
+                // the passphrase.
             }
         }
 

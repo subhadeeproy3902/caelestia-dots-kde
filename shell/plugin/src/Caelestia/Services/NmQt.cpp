@@ -170,6 +170,16 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
         && !targetAp->rsnFlags()
         && !targetAp->capabilities().testFlag(NetworkManager::AccessPoint::Privacy);
 
+    // Choose SAE only when the AP offers it *exclusively*. WPA2/WPA3
+    // transition-mode APs advertise KeyMgmtPsk and KeyMgmtSAE together, and
+    // testing only for SAE picked WPA3 on every such network. Some drivers
+    // (Intel iwlwifi among them) then fail to associate even with a correct
+    // passphrase, while the WPA-PSK path the AP still offers works fine.
+    const NetworkManager::AccessPoint::WpaFlags rsnFlags =
+        targetAp ? targetAp->rsnFlags() : NetworkManager::AccessPoint::WpaFlags();
+    const bool useSae = rsnFlags.testFlag(NetworkManager::AccessPoint::KeyMgmtSAE)
+                     && !rsnFlags.testFlag(NetworkManager::AccessPoint::KeyMgmtPsk);
+
     // Look for a saved connection matching this SSID
     NetworkManager::Connection::Ptr existingConn;
     {
@@ -188,18 +198,17 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
         }
     }
 
-    if (existingConn && password.isEmpty()) {
-        // Activate existing connection
+    // Activates a profile that already exists and reports the outcome to QML.
+    auto activateSaved = [this, ssid, callback](const NetworkManager::Connection::Ptr& conn,
+                                                const NetworkManager::WirelessDevice::Ptr& dev) {
         m_connectingSsid = ssid;
         emit connectingSsidChanged();
 
         QDBusPendingReply<QDBusObjectPath> reply =
-            NetworkManager::activateConnection(existingConn->path(),
-                                                wifiDev->uni(),
-                                                QString());
+            NetworkManager::activateConnection(conn->path(), dev->uni(), QString());
         auto* watcher = new QDBusPendingCallWatcher(reply, this);
         connect(watcher, &QDBusPendingCallWatcher::finished, this,
-                [this, ssid, callback](QDBusPendingCallWatcher* w) {
+                [this, callback](QDBusPendingCallWatcher* w) {
             w->deleteLater();
             QDBusPendingReply<QDBusObjectPath> r = *w;
             if (r.isError()) {
@@ -210,6 +219,88 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
             } else {
                 invokeCallback(callback, true, "Connection activated");
             }
+        });
+    };
+
+    if (existingConn && password.isEmpty()) {
+        if (apIsOpen) {
+            activateSaved(existingConn, wifiDev);
+            return;
+        }
+
+        // A saved profile is not proof that a passphrase is stored with it: a
+        // profile can be created by hand, or have its secret cleared after a
+        // failed attempt. Activating one of those makes NetworkManager ask a
+        // secret agent the shell does not run, and the request is cancelled a
+        // moment later ("no secrets: User canceled the secrets request"), which
+        // looked like the network refusing us. Ask NM what it actually holds and
+        // fall back to the password dialog when the passphrase is missing.
+        QDBusPendingReply<NMVariantMapMap> secretsReply =
+            existingConn->secrets(QStringLiteral("802-11-wireless-security"));
+        auto* secretsWatcher = new QDBusPendingCallWatcher(secretsReply, this);
+        connect(secretsWatcher, &QDBusPendingCallWatcher::finished, this,
+                [this, ssid, callback, existingConn, wifiDev, activateSaved](QDBusPendingCallWatcher* w) {
+            w->deleteLater();
+            QDBusPendingReply<NMVariantMapMap> r = *w;
+
+            bool haveSecret = false;
+            if (!r.isError()) {
+                const QVariantMap sec = r.value().value(QStringLiteral("802-11-wireless-security"));
+                const QStringList secretKeys{ QStringLiteral("psk"), QStringLiteral("wep-key0") };
+                for (const QString& key : secretKeys) {
+                    if (!sec.value(key).toString().isEmpty()) {
+                        haveSecret = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!haveSecret) {
+                qCInfo(lcNmQt) << "connectToNetwork:" << ssid
+                               << "has a saved profile but no stored passphrase";
+                m_connectingSsid.clear();
+                emit connectingSsidChanged();
+                invokeCallback(callback, false, {},
+                               "Secrets were required, but not provided", -1, true);
+                return;
+            }
+
+            activateSaved(existingConn, wifiDev);
+        });
+        return;
+    }
+
+    if (existingConn && !password.isEmpty()) {
+        // Store the new passphrase on the profile we already have. Calling
+        // AddAndActivate here would leave a second profile for the same SSID
+        // behind, which is why the password dialog used to delete the network
+        // before retrying and took any hand-tuned settings down with it.
+        NMVariantMapMap connSettings = existingConn->settings()->toMap();
+
+        QVariantMap secMap = connSettings.value(QStringLiteral("802-11-wireless-security"));
+        secMap[QStringLiteral("key-mgmt")] = useSae ? QStringLiteral("sae")
+                                                    : QStringLiteral("wpa-psk");
+        secMap[QStringLiteral("psk")] = password;
+        connSettings[QStringLiteral("802-11-wireless-security")] = secMap;
+
+        QVariantMap wifiMap = connSettings.value(QStringLiteral("802-11-wireless"));
+        wifiMap[QStringLiteral("security")] = QStringLiteral("802-11-wireless-security");
+        connSettings[QStringLiteral("802-11-wireless")] = wifiMap;
+
+        QDBusPendingReply<> updateReply = existingConn->update(connSettings);
+        auto* updateWatcher = new QDBusPendingCallWatcher(updateReply, this);
+        connect(updateWatcher, &QDBusPendingCallWatcher::finished, this,
+                [this, ssid, callback, existingConn, wifiDev, activateSaved](QDBusPendingCallWatcher* w) {
+            w->deleteLater();
+            QDBusPendingReply<> r = *w;
+            if (r.isError()) {
+                qCWarning(lcNmQt) << "updating" << ssid << "failed:" << r.error().message();
+                m_connectingSsid.clear();
+                emit connectingSsidChanged();
+                invokeCallback(callback, false, {}, r.error().message(), -1);
+                return;
+            }
+            activateSaved(existingConn, wifiDev);
         });
         return;
     }
@@ -228,6 +319,12 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
     // represent the nested wireless and security settings NetworkManager needs.
     NetworkManager::ConnectionSettings settings(NetworkManager::ConnectionSettings::Wireless);
     settings.setId(ssid);
+    // A freshly constructed ConnectionSettings carries an all-zero UUID, which
+    // NetworkManager rejects outright ("connection.uuid: '{0000...}' is not a
+    // valid UUID"). Every attempt to join a network with no saved profile
+    // failed on that error before it ever reached the access point, which read
+    // as a correct password being refused.
+    settings.setUuid(NetworkManager::ConnectionSettings::createNewUuid());
 
     auto wirelessSetting = settings.setting(NetworkManager::Setting::SettingType::Wireless)
                                 .dynamicCast<NetworkManager::WirelessSetting>();
@@ -240,9 +337,14 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
     wirelessSetting->setMode(NetworkManager::WirelessSetting::Infrastructure);
     wirelessSetting->setInitialized(true);
 
+    // Which access point to associate with is carried by the "specific object"
+    // argument below, not by the profile. Writing the bssid into the profile
+    // was wrong twice over: this string is "AA:BB:CC:DD:EE:FF" text while the
+    // D-Bus property takes six raw bytes, so NetworkManager refused the whole
+    // connection with "802-11-wireless.bssid: property is invalid", and even
+    // when accepted it would pin the saved network to a single access point and
+    // stop it roaming to the others advertising the same SSID.
     QString specificObject;
-    if (!bssid.isEmpty())
-        wirelessSetting->setBssid(bssid.toUtf8());
     if (targetAp)
         specificObject = targetAp->uni();
 
@@ -254,10 +356,8 @@ void NmQt::connectToNetwork(const QString& ssid, const QString& password,
             return;
         }
 
-        // Prefer SAE (WPA3) key management when the AP advertises it; fall back
-        // to WPA-PSK for WPA/WPA2 networks. Hard-coding WpaPsk here previously
-        // made pure WPA3/SAE APs reject an otherwise-correct password.
-        const bool useSae = targetAp && targetAp->rsnFlags().testFlag(NetworkManager::AccessPoint::KeyMgmtSAE);
+        // useSae is decided once above, from whether the AP offers SAE without
+        // also offering PSK.
         securitySetting->setKeyMgmt(useSae
             ? NetworkManager::WirelessSecuritySetting::SAE
             : NetworkManager::WirelessSecuritySetting::WpaPsk);
